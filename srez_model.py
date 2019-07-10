@@ -3,14 +3,37 @@ import tensorflow as tf
 
 FLAGS = tf.app.flags.FLAGS
 
+def combined_static_and_dynamic_shape(tensor):
+  """Returns a list containing static and dynamic values for the dimensions.
+
+  Returns a list of static and dynamic values for shape dimensions. This is
+  useful to preserve static shapes when available in reshape operation.
+
+  Args:
+    tensor: A tensor of any type.
+
+  Returns:
+    A list of size tensor.shape.ndims containing integers or a scalar tensor.
+  """
+  static_tensor_shape = tensor.shape.as_list()
+  dynamic_tensor_shape = tf.shape(tensor)
+  combined_shape = []
+  for index, dim in enumerate(static_tensor_shape):
+    if dim is not None:
+      combined_shape.append(dim)
+    else:
+      combined_shape.append(dynamic_tensor_shape[index])
+  return combined_shape
+
 class Model:
     """A neural network model.
 
     Currently only supports a feedforward architecture."""
     
-    def __init__(self, name, features):
+    def __init__(self, name, features, is_training = True):
         self.name = name
         self.outputs = [features]
+        self.is_training = is_training
 
     def _get_layer_str(self, layer=None):
         if layer is None:
@@ -19,13 +42,15 @@ class Model:
         return '%s_L%03d' % (self.name, layer+1)
 
     def _get_num_inputs(self):
-        return int(self.get_output().get_shape()[-1])
+        prev_shape = combined_static_and_dynamic_shape(self.get_output())
+        tf.cast(prev_shape[-1], tf.int32)
+        return tf.cast(prev_shape[-1], tf.int32)
 
     def _glorot_initializer(self, prev_units, num_units, stddev_factor=1.0):
         """Initialization in the style of Glorot 2010.
 
         stddev_factor should be 1.0 for linear activations, and 2.0 for ReLUs"""
-        stddev  = np.sqrt(stddev_factor / np.sqrt(prev_units*num_units))
+        stddev  = tf.sqrt(stddev_factor / tf.sqrt(tf.to_float(prev_units*num_units)))
         return tf.truncated_normal([prev_units, num_units],
                                     mean=0.0, stddev=stddev)
 
@@ -34,7 +59,7 @@ class Model:
 
         stddev_factor should be 1.0 for linear activations, and 2.0 for ReLUs"""
 
-        stddev  = np.sqrt(stddev_factor / (np.sqrt(prev_units*num_units)*mapsize*mapsize))
+        stddev  = tf.sqrt(stddev_factor / (tf.sqrt(tf.to_float(prev_units*num_units))*mapsize*mapsize))
         return tf.truncated_normal([mapsize, mapsize, prev_units, num_units],
                                     mean=0.0, stddev=stddev)
 
@@ -48,7 +73,8 @@ class Model:
 
         # TBD: This appears to be very flaky, often raising InvalidArgumentError internally
         with tf.variable_scope(self._get_layer_str()):
-            out = tf.contrib.layers.batch_norm(self.get_output(), scale=scale)
+            out = tf.contrib.layers.batch_norm(self.get_output(), scale=scale, is_training=self.is_training, 
+            updates_collections = None, variables_collections = tf.GraphKeys.TRAINABLE_VARIABLES )
         
         self.outputs.append(out)
         return self
@@ -57,7 +83,7 @@ class Model:
         """Transforms the output of this network to a 1D tensor"""
 
         with tf.variable_scope(self._get_layer_str()):
-            batch_size = int(self.get_output().get_shape()[0])
+            batch_size = combined_static_and_dynamic_shape(self.get_output())[0]
             out = tf.reshape(self.get_output(), [batch_size, -1])
 
         self.outputs.append(out)
@@ -180,10 +206,15 @@ class Model:
                                                      stddev_factor=stddev_factor)
             weight = tf.get_variable('weight', initializer=initw)
             weight = tf.transpose(weight, perm=[0, 1, 3, 2])
-            prev_output = self.get_output()
-            output_shape = [FLAGS.batch_size,
-                            int(prev_output.get_shape()[1]) * stride,
-                            int(prev_output.get_shape()[2]) * stride,
+            # prev_output = self.get_output()
+            # output_shape = [FLAGS.batch_size,
+            #                 int(prev_output.get_shape()[1]) * stride,
+            #                 int(prev_output.get_shape()[2]) * stride,
+            #                 num_units]
+            prev_shape = combined_static_and_dynamic_shape(self.get_output())
+            output_shape = [prev_shape[0],
+                            prev_shape[1] * stride,
+                            prev_shape[2] * stride,
                             num_units]
             out    = tf.nn.conv2d_transpose(self.get_output(), weight,
                                             output_shape=output_shape,
@@ -265,11 +296,13 @@ class Model:
         """Adds a layer that sums the top layer with the given term"""
 
         with tf.variable_scope(self._get_layer_str()):
-            prev_shape = self.get_output().get_shape()
-            term_shape = term.get_shape()
-            #print("%s %s" % (prev_shape, term_shape))
-            assert prev_shape == term_shape and "Can't sum terms with a different size"
-            out = tf.add(self.get_output(), term)
+            prev_shape = combined_static_and_dynamic_shape(self.get_output())
+            term_shape = combined_static_and_dynamic_shape(term)
+            with tf.control_dependencies([tf.assert_equal(prev_shape, term_shape)]):
+                out = tf.add(self.get_output(), term)
+            # print("%s %s" % (prev_shape, term_shape))
+            # assert prev_shape == term_shape and "Can't sum terms with a different size"
+            # out = tf.add(self.get_output(), term)
         
         self.outputs.append(out)
         return self
@@ -278,7 +311,7 @@ class Model:
         """Adds a layer that averages the inputs from the previous layer"""
 
         with tf.variable_scope(self._get_layer_str()):
-            prev_shape = self.get_output().get_shape()
+            prev_shape = combined_static_and_dynamic_shape(self.get_output())
             reduction_indices = list(range(len(prev_shape)))
             assert len(reduction_indices) > 2 and "Can't average a (batch, activation) tensor"
             reduction_indices = reduction_indices[1:-1]
@@ -290,8 +323,10 @@ class Model:
     def add_upscale(self):
         """Adds a layer that upscales the output by 2x through nearest neighbor interpolation"""
 
-        prev_shape = self.get_output().get_shape()
-        size = [2 * int(s) for s in prev_shape[1:3]]
+        # prev_shape = self.get_output().get_shape()
+        prev_shape = combined_static_and_dynamic_shape(self.get_output())
+        # size = [2 * int(s) for s in prev_shape[1:3]]
+        size = (tf.cast(prev_shape[1]*2, tf.int32),tf.cast(prev_shape[2]*2, tf.int32))
         out  = tf.image.resize_nearest_neighbor(self.get_output(), size)
 
         self.outputs.append(out)
@@ -321,14 +356,14 @@ class Model:
         scope = self._get_layer_str(layer)
         return tf.get_collection(tf.GraphKeys.VARIABLES, scope=scope)
 
-def _discriminator_model(sess, features, disc_input):
+def _discriminator_model(sess, features, disc_input, is_training = True):
     # Fully convolutional model
     mapsize = 3
     layers  = [64, 128, 256, 512]
 
-    old_vars = tf.all_variables()
+    old_vars = tf.global_variables()
 
-    model = Model('DIS', 2*disc_input - 1)
+    model = Model('DIS', 2*disc_input - 1, is_training)
 
     for layer in range(len(layers)):
         nunits = layers[layer]
@@ -352,21 +387,21 @@ def _discriminator_model(sess, features, disc_input):
     model.add_conv2d(1, mapsize=1, stride=1, stddev_factor=stddev_factor)
     model.add_mean()
 
-    new_vars  = tf.all_variables()
+    new_vars  = tf.global_variables()
     disc_vars = list(set(new_vars) - set(old_vars))
 
     return model.get_output(), disc_vars
 
-def _generator_model(sess, features, labels, channels):
+def _generator_model(sess, features, channels, is_training = True):
     # Upside-down all-convolutional resnet
 
     mapsize = 3
     res_units  = [256, 128, 96]
 
-    old_vars = tf.all_variables()
+    old_vars = tf.global_variables()
 
     # See Arxiv 1603.05027
-    model = Model('GEN', features)
+    model = Model('GEN', features, is_training)
 
     for ru in range(len(res_units)-1):
         nunits  = res_units[ru]
@@ -396,10 +431,43 @@ def _generator_model(sess, features, labels, channels):
     model.add_conv2d(channels, mapsize=1, stride=1, stddev_factor=1.)
     model.add_sigmoid()
     
-    new_vars  = tf.all_variables()
+    new_vars  = tf.global_variables()
     gene_vars = list(set(new_vars) - set(old_vars))
 
     return model.get_output(), gene_vars
+
+def create_inference_model(sess, features, labels):
+    # add by wqvbjhc - 20190701
+    rows      = int(features.get_shape()[1])
+    cols      = int(features.get_shape()[2])
+    channels  = int(features.get_shape()[3])
+
+    gene_minput = tf.placeholder(tf.float32, shape=[None,None,None, channels], name='inputs')
+
+    # TBD: Is there a better way to instance the generator?
+    with tf.variable_scope('gene') as scope:
+        gene_output, gene_var_list = \
+                    _generator_model(sess, features, channels, is_training=False)
+
+        scope.reuse_variables()
+
+        gene_moutput, _ = _generator_model(sess, gene_minput, channels, is_training=False)
+    gene_moutput = tf.identity(gene_moutput, name='gene_output')
+
+    # Discriminator with real data
+    disc_real_input = tf.identity(labels, name='disc_real_input')
+
+    # TBD: Is there a better way to instance the discriminator?
+    with tf.variable_scope('disc') as scope:
+        disc_real_output, disc_var_list = \
+                _discriminator_model(sess, features, disc_real_input, is_training=False)
+
+        scope.reuse_variables()
+            
+        disc_fake_output, _ = _discriminator_model(sess, features, gene_output, is_training=False)
+
+    return [gene_minput,      gene_moutput]
+
 
 def create_model(sess, features, labels):
     # Generator
@@ -407,17 +475,18 @@ def create_model(sess, features, labels):
     cols      = int(features.get_shape()[2])
     channels  = int(features.get_shape()[3])
 
-    gene_minput = tf.placeholder(tf.float32, shape=[FLAGS.batch_size, rows, cols, channels])
+    gene_minput = tf.placeholder(tf.float32, shape=[None,None,None, channels], name='inputs')
 
     # TBD: Is there a better way to instance the generator?
     with tf.variable_scope('gene') as scope:
         gene_output, gene_var_list = \
-                    _generator_model(sess, features, labels, channels)
+                    _generator_model(sess, features, channels)
 
         scope.reuse_variables()
 
-        gene_moutput, _ = _generator_model(sess, gene_minput, labels, channels)
-    
+        gene_moutput, _ = _generator_model(sess, gene_minput, channels)
+    gene_moutput = tf.identity(gene_moutput, name='gene_output')
+
     # Discriminator with real data
     disc_real_input = tf.identity(labels, name='disc_real_input')
 
@@ -449,7 +518,7 @@ def _downscale(images, K):
 
 def create_generator_loss(disc_output, gene_output, features):
     # I.e. did we fool the discriminator?
-    cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(disc_output, tf.ones_like(disc_output))
+    cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_output, labels=tf.ones_like(disc_output))
     gene_ce_loss  = tf.reduce_mean(cross_entropy, name='gene_ce_loss')
 
     # I.e. does the result look like the feature?
@@ -466,10 +535,10 @@ def create_generator_loss(disc_output, gene_output, features):
 
 def create_discriminator_loss(disc_real_output, disc_fake_output):
     # I.e. did we correctly identify the input as real or not?
-    cross_entropy_real = tf.nn.sigmoid_cross_entropy_with_logits(disc_real_output, tf.ones_like(disc_real_output))
+    cross_entropy_real = tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_real_output, labels=tf.ones_like(disc_real_output))
     disc_real_loss     = tf.reduce_mean(cross_entropy_real, name='disc_real_loss')
     
-    cross_entropy_fake = tf.nn.sigmoid_cross_entropy_with_logits(disc_fake_output, tf.zeros_like(disc_fake_output))
+    cross_entropy_fake = tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_fake_output, labels=tf.zeros_like(disc_fake_output))
     disc_fake_loss     = tf.reduce_mean(cross_entropy_fake, name='disc_fake_loss')
 
     return disc_real_loss, disc_fake_loss
@@ -487,8 +556,9 @@ def create_optimizers(gene_loss, gene_var_list,
                                        beta1=FLAGS.learning_beta1,
                                        name='disc_optimizer')
 
-    gene_minimize = gene_opti.minimize(gene_loss, var_list=gene_var_list, name='gene_loss_minimize', global_step=global_step)
-    
-    disc_minimize     = disc_opti.minimize(disc_loss, var_list=disc_var_list, name='disc_loss_minimize', global_step=global_step)
+    extra_update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    with tf.control_dependencies(extra_update_ops):
+        gene_minimize = gene_opti.minimize(gene_loss, var_list=gene_var_list, name='gene_loss_minimize', global_step=global_step)        
+        disc_minimize = disc_opti.minimize(disc_loss, var_list=disc_var_list, name='disc_loss_minimize', global_step=global_step)
     
     return (global_step, learning_rate, gene_minimize, disc_minimize)

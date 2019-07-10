@@ -2,7 +2,7 @@ import tensorflow as tf
 
 FLAGS = tf.app.flags.FLAGS
 
-def setup_inputs(sess, filenames, image_size=None, capacity_factor=3):
+def setup_inputs(sess, filenames, image_size=None, capacity_factor=3, istrain = True):
 
     if image_size is None:
         image_size = FLAGS.sample_size
@@ -16,17 +16,21 @@ def setup_inputs(sess, filenames, image_size=None, capacity_factor=3):
     image.set_shape([None, None, channels])
 
     # Crop and other random augmentations
-    image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_saturation(image, .95, 1.05)
-    image = tf.image.random_brightness(image, .05)
-    image = tf.image.random_contrast(image, .95, 1.05)
+    if istrain:
+        image = tf.image.random_flip_left_right(image)
+        image = tf.image.random_saturation(image, .95, 1.05)
+        image = tf.image.random_brightness(image, .05)
+        image = tf.image.random_contrast(image, .95, 1.05)
 
     wiggle = 8
     off_x, off_y = 25-wiggle, 60-wiggle
     crop_size = 128
     crop_size_plus = crop_size + 2*wiggle
     image = tf.image.crop_to_bounding_box(image, off_y, off_x, crop_size_plus, crop_size_plus)
-    image = tf.random_crop(image, [crop_size, crop_size, 3])
+    if istrain:
+        image = tf.random_crop(image, [crop_size, crop_size, 3])
+    else:
+        image = tf.image.resize_image_with_crop_or_pad(image, crop_size, crop_size)
 
     image = tf.reshape(image, [1, crop_size, crop_size, 3])
     image = tf.cast(image, tf.float32)/255.0
